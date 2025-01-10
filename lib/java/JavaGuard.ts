@@ -498,35 +498,37 @@ export async function validateSelectedJvm(path: string, semverRange: string): Pr
  * 
  * @returns {Promise.<RemoteJdkDistribution | null>} Promise which resolved to an object containing the JDK download data.
  */
-export async function latestOpenJDK(major: number, dataDir: string, distribution?: JdkDistribution): Promise<Asset | null> {
-
+export async function latestOpenJDK(major: number, dataDir: string, distribution?: JdkDistribution, isVersionBelow120?: boolean): Promise<Asset | null> {
+    
     if(distribution == null) {
         // If no distribution is specified, use Corretto on macOS and Temurin for all else.
         if(process.platform === Platform.DARWIN) {
-            return latestCorretto(major, dataDir)
+            return latestCorretto(major, dataDir, isVersionBelow120);
         } else {
-            return latestAdoptium(major, dataDir)
+            return latestAdoptium(major, dataDir, isVersionBelow120);
         }
     } else {
         // Respect the preferred distribution.
         switch(distribution) {
             case JdkDistribution.TEMURIN:
-                return latestAdoptium(major, dataDir)
+                return latestAdoptium(major, dataDir, isVersionBelow120);
             case JdkDistribution.CORRETTO:
-                return latestCorretto(major, dataDir)
+                return latestCorretto(major, dataDir, isVersionBelow120);
             default: {
-                const eMsg = `Unknown distribution '${distribution}'`
-                log.error(eMsg)
-                throw new Error(eMsg)
+                const eMsg = `Unknown distribution '${distribution}'`;
+                log.error(eMsg);
+                throw new Error(eMsg);
             }
         }
     }
 }
 
-export async function latestAdoptium(major: number, dataDir: string): Promise<Asset | null> {
 
-    const sanitizedOS = process.platform === Platform.WIN32 ? 'windows' : (process.platform === Platform.DARWIN ? 'mac' : process.platform)
-    const arch: string = process.arch === Architecture.ARM64 ? 'aarch64' : Architecture.X64
+export async function latestAdoptium(major: number, dataDir: string, isVersionBelow120?: boolean): Promise<Asset | null> {
+    
+    const sanitizedOS = process.platform === Platform.WIN32 ? 'windows' : (process.platform === Platform.DARWIN ? 'mac' : process.platform);
+    const arch = (process.platform === Platform.DARWIN && isVersionBelow120) ? Architecture.X64 : (process.arch === Architecture.ARM64 ? 'aarch64' : Architecture.X64);
+
     const url = `https://api.adoptium.net/v3/assets/latest/${major}/hotspot?vendor=eclipse`
 
     try {
@@ -563,10 +565,10 @@ export async function latestAdoptium(major: number, dataDir: string): Promise<As
     }
 }
 
-export async function latestCorretto(major: number, dataDir: string): Promise<Asset | null> {
+export async function latestCorretto(major: number, dataDir: string, isVersionBelow120?: boolean): Promise<Asset | null> {
 
-    let sanitizedOS: string, ext: string
-    const arch = process.arch === Architecture.ARM64 ? 'aarch64' : Architecture.X64
+    let sanitizedOS: string, ext: string;
+    const arch = (process.platform === Platform.DARWIN && isVersionBelow120) ? Architecture.X64 : (process.arch === Architecture.ARM64 ? 'aarch64' : Architecture.X64);
 
     switch(process.platform) {
         case Platform.WIN32:
