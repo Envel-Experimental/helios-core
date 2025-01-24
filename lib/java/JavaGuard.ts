@@ -395,33 +395,41 @@ export interface JvmDetails {
     path: string
 }
 
-export function filterApplicableJavaPaths(resolvedSettings: { [path: string]: HotSpotSettings }, semverRange: string): JvmDetails[] {
-
-    const arm = process.arch === Architecture.ARM64
+export function filterApplicableJavaPaths(
+    resolvedSettings: { [path: string]: HotSpotSettings },
+    semverRange: string,
+    isVersionBelow120?: boolean
+): JvmDetails[] {
+    const isMacOS = process.platform === Platform.DARWIN;
+    const isARM64 = process.arch === Architecture.ARM64;
 
     const jvmDetailsUnfiltered = Object.entries(resolvedSettings)
-        .filter(([, settings ]) => parseInt(settings['sun.arch.data.model']) === 64) // Only allow 64-bit.
-        .filter(([, settings ]) => arm ? settings['os.arch'] === 'aarch64' : true) // Only allow arm on arm architecture (disallow rosetta on m2 mac)
-        .map(([ path, settings ]) => {
-            const parsedVersion = parseJavaRuntimeVersion(settings['java.version'])
-            if(parsedVersion == null) {
-                log.error(`Failed to parse JDK version at location '${path}' (Vendor: ${settings['java.vendor']})`)
-                return null!
+        .filter(([, settings]) => parseInt(settings['sun.arch.data.model']) === 64)
+        .filter(([, settings]) => {
+            if (isMacOS && isARM64 && isVersionBelow120) {
+                return settings['os.arch'] === 'amd64';
             }
-            return {
-                semver: parsedVersion,
-                semverStr: javaVersionToString(parsedVersion),
-                vendor: settings['java.vendor'],
-                path
+            if (isMacOS && isARM64 && !isVersionBelow120) {
+                return settings['os.arch'] === 'aarch64';
             }
+            return true;
         })
-        .filter(x => x != null)
+        .map(([path, settings]) => {
+            const parsedVersion = parseJavaRuntimeVersion(settings['java.version']);
+            if (!parsedVersion) return null!;
+            return { 
+                semver: parsedVersion, 
+                semverStr: javaVersionToString(parsedVersion), 
+                vendor: settings['java.vendor'], 
+                path 
+            };
+        })
+        .filter(x => x != null);
 
-    // Now filter by options.
     const jvmDetails = jvmDetailsUnfiltered
-        .filter(details => semver.satisfies(details.semverStr, semverRange))
+        .filter(details => semver.satisfies(details.semverStr, semverRange));
 
-    return jvmDetails
+    return jvmDetails;
 }
 
 export function rankApplicableJvms(details: JvmDetails[]): void {
