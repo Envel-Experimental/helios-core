@@ -393,15 +393,54 @@ export interface JvmDetails {
     semverStr: string
     vendor: string
     path: string
+    arch: string // Added to store architecture
 }
 
-export function filterApplicableJavaPaths(resolvedSettings: { [path: string]: HotSpotSettings }, semverRange: string): JvmDetails[] {
+// minecraftVersion is a string like "1.16.5", "1.12.2", etc.
+// We'll consider versions < 1.17 as "legacy" for ARM Macs.
+// This is a simplified check. A more robust solution might involve
+// checking the exact LWJGL version used by the Minecraft version.
+function isLegacyMinecraftVersionForArm(minecraftVersion?: string): boolean {
+    if (!minecraftVersion) return false // Default to modern if version unknown
+    const parts = minecraftVersion.split('.')
+    if (parts.length < 2) return false // Invalid format
+    const major = parseInt(parts[0])
+    const minor = parseInt(parts[1])
+    if (isNaN(major) || isNaN(minor)) return false // Invalid format
 
-    const arm = process.arch === Architecture.ARM64
+    // Minecraft 1.17 was the first to officially support ARM64 Java via LWJGL 3.
+    // Versions before that are safer with x86_64 Java on ARM Macs.
+    if (major < 1 || (major === 1 && minor < 17)) {
+        return true
+    }
+    return false
+}
+
+export function filterApplicableJavaPaths(
+    resolvedSettings: { [path: string]: HotSpotSettings },
+    semverRange: string,
+    minecraftVersion?: string // Optional: Minecraft version string
+): JvmDetails[] {
+
+    const isArmHost = process.arch === Architecture.ARM64
+    const preferX64ForLegacy = isArmHost && isLegacyMinecraftVersionForArm(minecraftVersion)
 
     const jvmDetailsUnfiltered = Object.entries(resolvedSettings)
         .filter(([, settings ]) => parseInt(settings['sun.arch.data.model']) === 64) // Only allow 64-bit.
-        .filter(([, settings ]) => arm ? settings['os.arch'] === 'aarch64' : true) // Only allow arm on arm architecture (disallow rosetta on m2 mac)
+        .filter(([, settings ]) => {
+            if (isArmHost) {
+                if (preferX64ForLegacy) {
+                    // For legacy versions on ARM, allow x86_64 (which runs via Rosetta)
+                    // and also native aarch64 if available (though x86_64 is preferred)
+                    return settings['os.arch'] === 'x86_64' || settings['os.arch'] === 'aarch64'
+                } else {
+                    // For modern versions on ARM, strictly prefer aarch64
+                    return settings['os.arch'] === 'aarch64'
+                }
+            }
+            // For non-ARM hosts, os.arch is typically x86_64, so no change needed here.
+            return true
+        })
         .map(([ path, settings ]) => {
             const parsedVersion = parseJavaRuntimeVersion(settings['java.version'])
             if(parsedVersion == null) {
@@ -412,7 +451,8 @@ export function filterApplicableJavaPaths(resolvedSettings: { [path: string]: Ho
                 semver: parsedVersion,
                 semverStr: javaVersionToString(parsedVersion),
                 vendor: settings['java.vendor'],
-                path
+                path,
+                arch: settings['os.arch'] // Store the architecture
             }
         })
         .filter(x => x != null)
@@ -424,34 +464,45 @@ export function filterApplicableJavaPaths(resolvedSettings: { [path: string]: Ho
     return jvmDetails
 }
 
-export function rankApplicableJvms(details: JvmDetails[]): void {
+export function rankApplicableJvms(details: JvmDetails[], minecraftVersion?: string): void {
+    const isArmHost = process.arch === Architecture.ARM64
+    const preferX64ForLegacy = isArmHost && isLegacyMinecraftVersionForArm(minecraftVersion)
+
     details.sort((a, b) => {
-
-        if(a.semver.major === b.semver.major){
-            if(a.semver.minor === b.semver.minor){
-                if(a.semver.patch === b.semver.patch){
-
-                    // Same version, give priority to JRE.
-                    if(a.path.toLowerCase().includes('jdk')){
-                        return b.path.toLowerCase().includes('jdk') ? 0 : 1
-                    } else {
-                        return -1
-                    }
-
-                } else {
-                    return (a.semver.patch - b.semver.patch)*-1
-                }
-            } else {
-                return (a.semver.minor - b.semver.minor)*-1
+        // Priority 1: If on ARM host and legacy MC version, prefer x86_64 over aarch64
+        if (preferX64ForLegacy) {
+            if (a.arch === 'x86_64' && b.arch === 'aarch64') {
+                return -1 // a (x86_64) comes before b (aarch64)
             }
-        } else {
-            return (a.semver.major - b.semver.major)*-1
+            if (a.arch === 'aarch64' && b.arch === 'x86_64') {
+                return 1 // b (x86_64) comes before a (aarch64)
+            }
         }
+
+        // Priority 2: Semver comparison (descending order)
+        const semverComparison = semver.compare(b.semverStr, a.semverStr) // Note: b vs a for descending
+        if (semverComparison !== 0) {
+            return semverComparison
+        }
+
+        // Priority 3: Prefer JRE over JDK if versions and arch are otherwise equal
+        const aIsJdk = a.path.toLowerCase().includes('jdk')
+        const bIsJdk = b.path.toLowerCase().includes('jdk')
+
+        if (aIsJdk && !bIsJdk) {
+            return 1 // b (JRE) comes before a (JDK)
+        }
+        if (!aIsJdk && bIsJdk) {
+            return -1 // a (JRE) comes before b (JDK)
+        }
+
+        return 0 // Keep original order if all else is equal
     })
 }
 
 // Used to discover the best installation.
-export async function discoverBestJvmInstallation(dataDir: string, semverRange: string): Promise<JvmDetails | null> {
+// Added minecraftVersion parameter
+export async function discoverBestJvmInstallation(dataDir: string, semverRange: string, minecraftVersion?: string): Promise<JvmDetails | null> {
 
     // Get candidates, filter duplicates out.
     const paths = [...new Set<string>(await getValidatableJavaPaths(dataDir))]
@@ -459,17 +510,18 @@ export async function discoverBestJvmInstallation(dataDir: string, semverRange: 
     // Get VM settings.
     const resolvedSettings = await resolveJvmSettings(paths)
 
-    // Filter
-    const jvmDetails = filterApplicableJavaPaths(resolvedSettings, semverRange)
+    // Filter, passing minecraftVersion
+    const jvmDetails = filterApplicableJavaPaths(resolvedSettings, semverRange, minecraftVersion)
 
-    // Rank
-    rankApplicableJvms(jvmDetails)
+    // Rank, passing minecraftVersion
+    rankApplicableJvms(jvmDetails, minecraftVersion)
 
     return jvmDetails.length > 0 ? jvmDetails[0] : null
 }
 
 // Used to validate the selected jvm.
-export async function validateSelectedJvm(path: string, semverRange: string): Promise<JvmDetails | null> {
+// Added minecraftVersion parameter
+export async function validateSelectedJvm(path: string, semverRange: string, minecraftVersion?: string): Promise<JvmDetails | null> {
 
     if(!await pathExists(path)) {
         return null
@@ -478,11 +530,11 @@ export async function validateSelectedJvm(path: string, semverRange: string): Pr
     // Get VM settings.
     const resolvedSettings = await resolveJvmSettings([path])
 
-    // Filter
-    const jvmDetails = filterApplicableJavaPaths(resolvedSettings, semverRange)
+    // Filter, passing minecraftVersion
+    const jvmDetails = filterApplicableJavaPaths(resolvedSettings, semverRange, minecraftVersion)
 
-    // Rank
-    rankApplicableJvms(jvmDetails)
+    // Rank (though likely only one result here, ranking is harmless)
+    rankApplicableJvms(jvmDetails, minecraftVersion)
 
     return jvmDetails.length > 0 ? jvmDetails[0] : null
 }
@@ -498,22 +550,33 @@ export async function validateSelectedJvm(path: string, semverRange: string): Pr
  * 
  * @returns {Promise.<RemoteJdkDistribution | null>} Promise which resolved to an object containing the JDK download data.
  */
-export async function latestOpenJDK(major: number, dataDir: string, distribution?: JdkDistribution): Promise<Asset | null> {
+export async function latestOpenJDK(
+    major: number,
+    dataDir: string,
+    distribution?: JdkDistribution,
+    minecraftVersion?: string // Added minecraftVersion
+): Promise<Asset | null> {
+
+    // Determine target architecture based on Minecraft version for ARM hosts
+    let targetArch: Architecture = process.arch as Architecture
+    if (process.platform === Platform.DARWIN && process.arch === Architecture.ARM64 && isLegacyMinecraftVersionForArm(minecraftVersion)) {
+        targetArch = Architecture.X64 // Request x64 for legacy versions on ARM Macs
+    }
 
     if(distribution == null) {
         // If no distribution is specified, use Corretto on macOS and Temurin for all else.
         if(process.platform === Platform.DARWIN) {
-            return latestCorretto(major, dataDir)
+            return latestCorretto(major, dataDir, targetArch) // Pass targetArch
         } else {
-            return latestAdoptium(major, dataDir)
+            return latestAdoptium(major, dataDir, targetArch) // Pass targetArch
         }
     } else {
         // Respect the preferred distribution.
         switch(distribution) {
             case JdkDistribution.TEMURIN:
-                return latestAdoptium(major, dataDir)
+                return latestAdoptium(major, dataDir, targetArch) // Pass targetArch
             case JdkDistribution.CORRETTO:
-                return latestCorretto(major, dataDir)
+                return latestCorretto(major, dataDir, targetArch) // Pass targetArch
             default: {
                 const eMsg = `Unknown distribution '${distribution}'`
                 log.error(eMsg)
@@ -523,10 +586,15 @@ export async function latestOpenJDK(major: number, dataDir: string, distribution
     }
 }
 
-export async function latestAdoptium(major: number, dataDir: string): Promise<Asset | null> {
+export async function latestAdoptium(
+    major: number,
+    dataDir: string,
+    targetArch: Architecture = process.arch as Architecture // Added targetArch, defaults to host arch
+): Promise<Asset | null> {
 
     const sanitizedOS = process.platform === Platform.WIN32 ? 'windows' : (process.platform === Platform.DARWIN ? 'mac' : process.platform)
-    const arch: string = process.arch === Architecture.ARM64 ? 'aarch64' : Architecture.X64
+    // Use targetArch for the request, converting to Adoptium's terms
+    const adoptiumArch: string = targetArch === Architecture.ARM64 ? 'aarch64' : Architecture.X64
     const url = `https://api.adoptium.net/v3/assets/latest/${major}/hotspot?vendor=eclipse`
 
     try {
@@ -536,7 +604,7 @@ export async function latestAdoptium(major: number, dataDir: string): Promise<As
                 return entry.version.major === major
                     && entry.binary.os === sanitizedOS
                     && entry.binary.image_type === 'jdk'
-                    && entry.binary.architecture === arch
+                    && entry.binary.architecture === adoptiumArch // Use adoptiumArch here
             })
 
             if(targetBinary != null) {
@@ -549,7 +617,7 @@ export async function latestAdoptium(major: number, dataDir: string): Promise<As
                     path: join(getLauncherRuntimeDir(dataDir), targetBinary.binary.package.name)
                 }
             } else {
-                log.error(`Failed to find a suitable Adoptium binary for JDK ${major} (${sanitizedOS} ${arch}).`)
+                log.error(`Failed to find a suitable Adoptium binary for JDK ${major} (${sanitizedOS} ${adoptiumArch}).`)
                 return null
             }
         } else {
@@ -563,10 +631,16 @@ export async function latestAdoptium(major: number, dataDir: string): Promise<As
     }
 }
 
-export async function latestCorretto(major: number, dataDir: string): Promise<Asset | null> {
+export async function latestCorretto(
+    major: number,
+    dataDir: string,
+    targetArch: Architecture = process.arch as Architecture // Added targetArch, defaults to host arch
+): Promise<Asset | null> {
 
     let sanitizedOS: string, ext: string
-    const arch = process.arch === Architecture.ARM64 ? 'aarch64' : Architecture.X64
+    // Use targetArch for the request, converting to Corretto's terms
+    const correttoArch: string = targetArch === Architecture.ARM64 ? 'aarch64' : Architecture.X64
+
 
     switch(process.platform) {
         case Platform.WIN32:
@@ -587,8 +661,8 @@ export async function latestCorretto(major: number, dataDir: string): Promise<As
             break
     }
 
-    const url = `https://corretto.aws/downloads/latest/amazon-corretto-${major}-${arch}-${sanitizedOS}-jdk.${ext}`
-    const md5url = `https://corretto.aws/downloads/latest_checksum/amazon-corretto-${major}-${arch}-${sanitizedOS}-jdk.${ext}`
+    const url = `https://corretto.aws/downloads/latest/amazon-corretto-${major}-${correttoArch}-${sanitizedOS}-jdk.${ext}`
+    const md5url = `https://corretto.aws/downloads/latest_checksum/amazon-corretto-${major}-${correttoArch}-${sanitizedOS}-jdk.${ext}`
     try {
         const res = await got.head(url)
         const checksum = await got.get(md5url)
@@ -600,14 +674,14 @@ export async function latestCorretto(major: number, dataDir: string): Promise<As
                 id: name,
                 hash: checksum.body,
                 algo: HashAlgo.MD5,
-                path: join(getLauncherRuntimeDir(dataDir), name)
+                path: join(getLauncherRuntimeDir(dataDir, targetArch), name) // Pass targetArch to getLauncherRuntimeDir
             }
         } else {
-            log.error(`Error while retrieving latest Corretto JDK ${major} (${sanitizedOS} ${arch}): ${res.statusCode} ${res.statusMessage ?? ''}`)
+            log.error(`Error while retrieving latest Corretto JDK ${major} (${sanitizedOS} ${correttoArch}): ${res.statusCode} ${res.statusMessage ?? ''}`)
             return null
         }
     } catch(err) {
-        log.error(`Error while retrieving latest Corretto JDK ${major} (${sanitizedOS} ${arch}).`, err)
+        log.error(`Error while retrieving latest Corretto JDK ${major} (${sanitizedOS} ${correttoArch}).`, err)
         return null
     }
 }
@@ -1092,6 +1166,6 @@ export function getPossibleJavaEnvs(): string[] {
     ]
 }
 
-export function getLauncherRuntimeDir(dataDir: string): string {
-    return join(dataDir, 'runtime', process.arch)
+export function getLauncherRuntimeDir(dataDir: string, targetArch: Architecture = process.arch as Architecture): string {
+    return join(dataDir, 'runtime', targetArch) // Use targetArch here
 }
