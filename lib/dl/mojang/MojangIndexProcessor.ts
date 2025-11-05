@@ -1,5 +1,5 @@
 import got, { RequestError } from 'got'
-import { Architecture } from 'helios-distribution-types'
+import { Architecture, Natives } from 'helios-distribution-types'
 import { dirname, join } from 'path'
 import { ensureDir, pathExists, readFile, readJson, writeFile } from 'fs-extra'
 
@@ -48,7 +48,7 @@ export class MojangIndexProcessor extends IndexProcessor {
 
     private async loadAssetIndex(versionJson: VersionJsonBase): Promise<AssetIndex> {
         const assetIndexPath = this.getAssetIndexPath(versionJson.assetIndex.id)
-        const assetIndex = await this.loadContentWithRemoteFallback<AssetIndex>(versionJson.assetIndex.url, assetIndexPath, { algo: HashAlgo.SHA1, value: versionJson.assetIndex.sha1 })
+        const assetIndex = await this.loadContentWithRemoteFallback<AssetIndex>(versionJson.assetIndex.url, assetIndexPath, versionJson.assetIndex.sha1)
         if (assetIndex == null) {
             throw new AssetGuardError(`Failed to download ${versionJson.assetIndex.id} asset index.`)
         }
@@ -62,7 +62,7 @@ export class MojangIndexProcessor extends IndexProcessor {
             if (versionInfo == null) {
                 throw new AssetGuardError(`Invalid version: ${version}.`)
             }
-            const versionJson = await this.loadContentWithRemoteFallback<VersionJsonBase>(versionInfo.url, versionJsonPath, { algo: HashAlgo.SHA1, value: versionInfo.sha1 })
+            const versionJson = await this.loadContentWithRemoteFallback<VersionJsonBase>(versionInfo.url, versionJsonPath, versionInfo.sha1)
             if (versionJson == null) {
                 throw new AssetGuardError(`Failed to download ${version} json index.`)
             }
@@ -74,7 +74,7 @@ export class MojangIndexProcessor extends IndexProcessor {
                 if (latestVersionInfo == null) {
                     throw new AssetGuardError('Cannot find the latest version.')
                 }
-                const latestVersionJson = await this.loadContentWithRemoteFallback<VersionJsonBase>(latestVersionInfo.url, latestVersionJsonPath, { algo: HashAlgo.SHA1, value: latestVersionInfo.sha1 })
+                const latestVersionJson = await this.loadContentWithRemoteFallback<VersionJsonBase>(latestVersionInfo.url, latestVersionJsonPath, latestVersionInfo.sha1)
                 if (latestVersionJson == null) {
                     throw new AssetGuardError(`Failed to download ${latestVersion} json index.`)
                 }
@@ -93,14 +93,14 @@ export class MojangIndexProcessor extends IndexProcessor {
         }
     }
 
-    private async loadContentWithRemoteFallback<T>(url: string, path: string, hash?: { algo: string, value: string }): Promise<T | null> {
+    private async loadContentWithRemoteFallback<T>(url: string, path: string, hash?: string): Promise<T | null> {
 
         try {
             if (await pathExists(path)) {
                 const buf = await readFile(path)
                 if (hash) {
-                    const bufHash = calculateHashByBuffer(buf, hash.algo)
-                    if (bufHash === hash.value) {
+                    const bufHash = calculateHashByBuffer(buf, HashAlgo.SHA1)
+                    if (bufHash === hash) {
                         return JSON.parse(buf.toString()) as T
                     }
                 } else {
@@ -168,7 +168,7 @@ export class MojangIndexProcessor extends IndexProcessor {
 
     private async validateAssets(assetIndex: AssetIndex): Promise<Asset[]> {
         const objectDir = join(this.assetPath, 'objects')
-        const promises = Object.entries(assetIndex.objects).map(async (assetEntry) => {
+        const promises = Object.entries(assetIndex.objects).map(async (assetEntry): Promise<Asset | null> => {
             const hash = assetEntry[1].hash
             const path = join(objectDir, hash.substring(0, 2), hash)
             const url = `${MojangIndexProcessor.ASSET_RESOURCE_ENDPOINT}/${hash.substring(0, 2)}/${hash}`
@@ -190,26 +190,33 @@ export class MojangIndexProcessor extends IndexProcessor {
 
     private async validateLibraries(versionJson: VersionJsonBase): Promise<Asset[]> {
         const libDir = getLibraryDir(this.commonDir)
-        const promises = versionJson.libraries.map(async (libEntry) => {
+        const promises = versionJson.libraries.map(async (libEntry): Promise<Asset | null> => {
             if (isLibraryCompatible(libEntry.rules, libEntry.natives)) {
-                let artifact: LibraryArtifact
+                let artifact: LibraryArtifact | undefined
                 if (libEntry.natives == null) {
                     artifact = libEntry.downloads.artifact
                 } else {
-                    const classifier = libEntry.natives[getMojangOS()].replace('${arch}', process.arch.replace('x', '')) as string
-                    artifact = libEntry.downloads.classifiers[classifier] as LibraryArtifact
+                    const os = getMojangOS() as keyof Natives
+                    if (libEntry.natives[os]) {
+                        const classifier = libEntry.natives[os]!.replace('${arch}', process.arch.replace('x', ''))
+                        if (libEntry.downloads.classifiers) {
+                            artifact = libEntry.downloads.classifiers[classifier as keyof typeof libEntry.downloads.classifiers]
+                        }
+                    }
                 }
 
-                const path = join(libDir, artifact.path)
-                const hash = artifact.sha1
-                if (!await validateLocalFile(path, HashAlgo.SHA1, hash)) {
-                    return {
-                        id: libEntry.name,
-                        hash,
-                        algo: HashAlgo.SHA1,
-                        size: artifact.size,
-                        url: artifact.url,
-                        path
+                if (artifact) {
+                    const path = join(libDir, artifact.path)
+                    const hash = artifact.sha1
+                    if (!await validateLocalFile(path, HashAlgo.SHA1, hash)) {
+                        return {
+                            id: libEntry.name,
+                            hash,
+                            algo: HashAlgo.SHA1,
+                            size: artifact.size,
+                            url: artifact.url,
+                            path
+                        }
                     }
                 }
             }
