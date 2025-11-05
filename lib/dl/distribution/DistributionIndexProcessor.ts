@@ -34,8 +34,7 @@ export class DistributionIndexProcessor extends IndexProcessor {
             throw new AssetGuardError(`Invalid server id ${this.serverId}`)
         }
 
-        const notValid: Asset[] = []
-        await this.validateModules(server.modules, notValid)
+        const notValid: Asset[] = (await this.validateModules(server.modules)).flat()
         await onStageComplete()
 
         return {
@@ -47,25 +46,29 @@ export class DistributionIndexProcessor extends IndexProcessor {
         await this.loadModLoaderVersionJson()
     }
 
-    private async validateModules(modules: HeliosModule[], accumulator: Asset[]): Promise<void> {
-        for(const module of modules) {
+    private async validateModules(modules: HeliosModule[]): Promise<Asset[]> {
+        const promises: Promise<Asset | Asset[] | null>[] = modules.map(async (module) => {
             const hash = module.rawModule.artifact.MD5
 
-            if(!await validateLocalFile(module.getPath(), HashAlgo.MD5, hash)) {
-                accumulator.push({
-                    id: module.rawModule.id,
-                    hash: hash!,
-                    algo: HashAlgo.MD5,
-                    size: module.rawModule.artifact.size,
-                    url: module.rawModule.artifact.url,
-                    path: module.getPath()
-                })
+            const asset: Asset | null = !await validateLocalFile(module.getPath(), HashAlgo.MD5, hash) ? {
+                id: module.rawModule.id,
+                hash: hash!,
+                algo: HashAlgo.MD5,
+                size: module.rawModule.artifact.size,
+                url: module.rawModule.artifact.url,
+                path: module.getPath()
+            } : null
+
+            if (module.hasSubModules()) {
+                const subModules = await this.validateModules(module.subModules)
+                return asset ? [asset, ...subModules] : subModules
             }
 
-            if(module.hasSubModules()) {
-                await this.validateModules(module.subModules, accumulator)
-            }
-        }
+            return asset
+        })
+
+        const results = await Promise.all(promises)
+        return results.flat().filter((asset): asset is Asset => asset !== null)
     }
 
     public async loadModLoaderVersionJson(): Promise<VersionJsonBase> {
