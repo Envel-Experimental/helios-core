@@ -1,7 +1,7 @@
 import got, { RequestError } from 'got'
 import { Architecture } from 'helios-distribution-types'
 import { dirname, join } from 'path'
-import { ensureDir, pathExists, readFile, readJson, writeFile } from 'fs-extra'
+import { copy, ensureDir, pathExists, readFile, readJson, writeFile } from 'fs-extra'
 
 import { Asset, HashAlgo } from '../Asset'
 import { AssetGuardError } from '../AssetGuardError'
@@ -191,7 +191,22 @@ export class MojangIndexProcessor extends IndexProcessor {
     }
 
     public async postDownload(): Promise<void> {
-        // no-op
+        if(process.platform === 'darwin' && process.arch === Architecture.ARM64 && !mcVersionAtLeast('1.19', this.version)) {
+            MojangIndexProcessor.logger.info('Performing ARM64 native patch..')
+            const nativesDir = join(this.commonDir, 'natives', this.version)
+            if(await pathExists(nativesDir)) {
+                try {
+                    const source = join(process.cwd(), 'runtimes', 'assets', 'glfw-fix', 'libglfw.3.8-ARM64.dylib')
+                    const destination = join(nativesDir, 'libglfw.dylib')
+                    await copy(source, destination)
+                    MojangIndexProcessor.logger.info('ARM64 native patch successful.')
+                } catch(err) {
+                    MojangIndexProcessor.logger.error('Error while patching ARM64 natives', err)
+                }
+            } else {
+                MojangIndexProcessor.logger.warn(`Skipping ARM64 native patch, ${nativesDir} does not exist.`)
+            }
+        }
     }
 
     private async validateAssets(assetIndex: AssetIndex): Promise<Asset[]> {
